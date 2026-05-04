@@ -4,61 +4,145 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
-#include <sys/select.h>
+#include <poll.h>
 
-int main(int argc, char *argv[]) {
-    if (argc != 4) {
-        printf("Cu phap: %s <port> <remote_ip> <remote_port>\n", argv[0]);
-        return 1;
-    }
-    int port = atoi(argv[1]);
-    char *remote_ip = argv[2];
-    int remote_port = atoi(argv[3]);
-    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (sock < 0) {
-        printf("Loi tao socket!\n");
-        return 1;
-    }
+#define PORT 9000
+#define MAX_CLIENTS 64
+#define MAX_TOPICS_PER_CLIENT 10
+#define TOPIC_LEN 32
 
-    struct sockaddr_in local_addr;
-    local_addr.sin_family = AF_INET;
-    local_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    local_addr.sin_port = htons(port);
-    if (bind(sock, (struct sockaddr *)&local_addr, sizeof(local_addr)) < 0) {
-        printf("Loi bind! Cong %d co the dang bi su dung.\n", port);
-        return 1;
-    }
+struct client_info {
+    int fd;
+    char topics[MAX_TOPICS_PER_CLIENT][TOPIC_LEN];
+    int topic_count;
+};
 
-    struct sockaddr_in remote_addr;
-    remote_addr.sin_family = AF_INET;
-    remote_addr.sin_addr.s_addr = inet_addr(remote_ip);
-    remote_addr.sin_port = htons(remote_port);
-    printf("--- Ung dung UDP Chat P2P ---\n");
-    printf("Lang nghe o cong: %d | Chat voi: %s:%d\n", port, remote_ip, remote_port);
-    printf("Go tin nhan cua ban roi an Enter (go 'exit' de thoat)...\n\n");
-    fd_set fdread, fdtest;
-    FD_ZERO(&fdread);
-    FD_SET(STDIN_FILENO, &fdread);
-    FD_SET(sock, &fdread);
-    int max_fd = (sock > STDIN_FILENO) ? sock : STDIN_FILENO;
-    char buf[1024];
-    while (1) {
-        fdtest = fdread;
-        int ret = select(max_fd + 1, &fdtest, NULL, NULL, NULL);
-        if (ret < 0) break;
-        if (FD_ISSET(STDIN_FILENO, &fdtest)) {
-            fgets(buf, sizeof(buf), stdin);
-            if (strncmp(buf, "exit", 4) == 0) break;
-            sendto(sock, buf, strlen(buf), 0, (struct sockaddr *)&remote_addr, sizeof(remote_addr));
+void subscribe_topic(struct client_info *client, char *topic) {
+    for (int i = 0; i < client->topic_count; i++) {
+        if (strcmp(client->topics[i], topic) == 0) {
+            char *msg = ">> Ban da dang ky chu de nay roi.\n";
+            send(client->fd, msg, strlen(msg), 0);
+            return;
         }
-        if (FD_ISSET(sock, &fdtest)) {
-            int bytes = recvfrom(sock, buf, sizeof(buf) - 1, 0, NULL, NULL);
-            if (bytes > 0) {
-                buf[bytes] = '\0';
-                printf("\r[Remote]: %s", buf); 
+    }
+    if (client->topic_count < MAX_TOPICS_PER_CLIENT) {
+        strcpy(client->topics[client->topic_count], topic);
+        client->topic_count++;
+        char msg[128];
+        sprintf(msg, ">> Dang ky thanh cong chu de: %s\n", topic);
+        send(client->fd, msg, strlen(msg), 0);
+        printf(">> Client %d dang ky chu de: %s\n", client->fd, topic);
+    } else {
+        char *msg = ">> Da vuot qua so luong chu de toi da.\n";
+        send(client->fd, msg, strlen(msg), 0);
+    }
+}
+
+void unsubscribe_topic(struct client_info *client, char *topic) {
+    for (int i = 0; i < client->topic_count; i++) {
+        if (strcmp(client->topics[i], topic) == 0) {
+            for (int j = i; j < client->topic_count - 1; j++) {
+                strcpy(client->topics[j], client->topics[j + 1]);
+            }
+            client->topic_count--;
+            char msg[128];
+            sprintf(msg, ">> Huy dang ky thanh cong chu de: %s\n", topic);
+            send(client->fd, msg, strlen(msg), 0);
+            printf(">> Client %d huy dang ky chu de: %s\n", client->fd, topic);
+            return;
+        }
+    }
+    char *msg = ">> Ban chua dang ky chu de nay.\n";
+    send(client->fd, msg, strlen(msg), 0);
+}
+
+void publish_message(struct pollfd fds[], struct client_info clients[], int nfds, int sender_fd, char *topic, char *msg) {
+    char out_buf[1024];
+    sprintf(out_buf, "[%s]: %s\n", topic, msg);
+    int receiver_count = 0;
+    for (int i = 1; i < nfds; i++) {
+        for (int j = 0; j < clients[i].topic_count; j++) {
+            if (strcmp(clients[i].topics[j], topic) == 0) {
+                send(clients[i].fd, out_buf, strlen(out_buf), 0);
+                receiver_count++;
+                break;
             }
         }
     }
-    close(sock);
+    printf(">> Client %d da gui tin nhan vao '%s' (Tiep can: %d clients)\n", sender_fd, topic, receiver_count);
+}
+
+void remove_client(struct pollfd fds[], struct client_info clients[], int *nfds, int index) {
+    close(fds[index].fd);
+    for (int i = index; i < *nfds - 1; i++) {
+        fds[i] = fds[i + 1];
+        clients[i] = clients[i + 1];
+    }
+    (*nfds)--;
+}
+
+int main() {
+    int listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    struct sockaddr_in addr;
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons(PORT);
+    if (bind(listener, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        printf("Loi bind! Cong %d co the dang bi chiem.\n", PORT);
+        return 1;
+    }
+    listen(listener, 5);
+    printf("Pub/Sub Server dang lang nghe o cong %d...\n", PORT);
+    struct pollfd fds[MAX_CLIENTS];
+    struct client_info clients[MAX_CLIENTS];
+    int nfds = 1;
+    fds[0].fd = listener;
+    fds[0].events = POLLIN;
+    char buf[1024];
+    while (1) {
+        int ret = poll(fds, nfds, -1);
+        if (ret < 0) break;
+        if (fds[0].revents & POLLIN) {
+            int new_client = accept(listener, NULL, NULL);
+            printf(">> Co client moi ket noi (ID: %d)\n", new_client);
+            fds[nfds].fd = new_client;
+            fds[nfds].events = POLLIN;
+            clients[nfds].fd = new_client;
+            clients[nfds].topic_count = 0; 
+            nfds++;
+            char *welcome = "Huong dan: SUB <topic> | UNSUB <topic> | PUB <topic> <msg>\n";
+            send(new_client, welcome, strlen(welcome), 0);
+        }
+        for (int i = 1; i < nfds; i++) {
+            if (fds[i].revents & (POLLIN | POLLERR)) {
+                int bytes = recv(fds[i].fd, buf, sizeof(buf) - 1, 0);
+                if (bytes <= 0) {
+                    printf(">> Client %d da thoat\n", fds[i].fd);
+                    remove_client(fds, clients, &nfds, i);
+                    i--; 
+                } else {
+                    buf[bytes] = '\0';
+                    buf[strcspn(buf, "\r\n")] = 0;
+                    char cmd[16] = "", topic[TOPIC_LEN] = "", msg[512] = "";
+                    int parsed = sscanf(buf, "%15s %31s %511[^\n]", cmd, topic, msg);
+
+                    if (strcmp(cmd, "SUB") == 0 && parsed >= 2) {
+                        subscribe_topic(&clients[i], topic);
+                    } 
+                    else if (strcmp(cmd, "UNSUB") == 0 && parsed >= 2) {
+                        unsubscribe_topic(&clients[i], topic);
+                    } 
+                    else if (strcmp(cmd, "PUB") == 0 && parsed >= 3) {
+                        publish_message(fds, clients, nfds, fds[i].fd, topic, msg);
+                    } 
+                    else {
+                        char *err = ">> Sai cu phap! Mau: SUB <topic> | UNSUB <topic> | PUB <topic> <msg>\n";
+                        send(fds[i].fd, err, strlen(err), 0);
+                    }
+                }
+            }
+        }
+    }
+    close(listener);
     return 0;
 }
